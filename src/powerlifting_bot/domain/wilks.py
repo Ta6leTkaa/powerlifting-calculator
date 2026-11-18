@@ -50,3 +50,10 @@ def wilks(sex: str, bodyweight: Decimal, lifted: Decimal) -> Decimal:
     for coefficient in reversed(COEFFICIENTS[sex]):
         denominator = denominator * bodyweight + Decimal(coefficient)
     return Decimal(500) * lifted / denominator
+
+
+def wilks_total(
+    sex: str, bodyweight: Decimal, squat: Decimal, bench: Decimal, deadlift: Decimal
+) -> Decimal:
+    lifts = [parse_weight(str(value)) for value in (squat, bench, deadlift)]
+    return wilks(sex, bodyweight, Decimal(1)) * sum(lifts)

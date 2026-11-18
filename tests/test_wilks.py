@@ -31,3 +31,11 @@ def test_formula_range():
         wilks("female", D(151), D(100))
     with pytest.raises(ValueError):
         wilks("male", D(39), D(100))
+
+
+def test_total_wilks_uses_sum_and_accepts_total_over_1000():
+    from powerlifting_bot.domain.wilks import wilks_total
+
+    score = wilks_total("male", D(100), D(400), D(300), D(400))
+    assert score.quantize(D(".01")) == D("669.45")
+    assert abs(score - wilks("male", D(100), D(100)) * 11) < D("0.00000001")

@@ -107,3 +107,124 @@ async def test_delete_requires_owner(service):
     assert await service.history(123) == []
     with pytest.raises(ValueError):
         await service.delete_result(123, row.id)
+
+
+@pytest.mark.parametrize("movement", ["bench", "squat", "deadlift"])
+async def test_individual_categories_are_separate(service, movement):
+    await service.register(123, "Атлет", "male", D(85), "UTC")
+    row = await service.add_lift(123, D("150.5"), D(85), date(2020, 1, 2), movement, movement)
+    assert (await service.result(123, row.id, movement)).movement == movement
+    assert len(await service.history(123, category=movement)) == 1
+    assert await service.history(123, category="total") == []
+    other = "squat" if movement != "squat" else "bench"
+    assert await service.result(123, row.id, other) is None
+    with pytest.raises(ValueError):
+        await service.update_result(123, row.id, D(200), D(85), date(2020, 1, 2), category=other)
+    await service.update_result(123, row.id, D(160), D(85), date(2020, 1, 3), category=movement)
+    assert (await service.result(123, row.id, movement)).lifted == D(160)
+
+
+async def test_total_is_atomic_separate_and_idempotent(service):
+    await service.register(123, "Атлет", "male", D(85), "UTC")
+    day = date(2020, 1, 2)
+    single = await service.add_bench(123, D(130), D(85), day, "single")
+    row = await service.add_total(123, D(400), D(300), D(400), D(85), day, "total")
+    duplicate = await service.add_total(123, D(400), D(300), D(400), D(85), day, "total")
+    assert duplicate.id == row.id
+    assert row.lifted == D(1100)
+    assert row.performed_on == day
+    assert len(await service.history(123, category="total")) == 1
+    assert len(await service.history(123)) == 4  # Original bench + three linked lifts.
+    assert (await service.result(123, single.id)).lifted == D(130)
+    updated = await service.update_total(
+        123, row.id, D(410), D(300), D(400), D(84), date(2020, 2, 1)
+    )
+    assert updated.lifted == D(1110)
+    assert updated.created_at.replace(tzinfo=None) == row.created_at.replace(tzinfo=None)
+    assert (await service.user(123)).bodyweight == D(85)
+    for movement, expected in [("squat", D(410)), ("bench", D(300)), ("deadlift", D(400))]:
+        rows = await service.history(123, category=movement)
+        child = next(item for item in rows if item.total_result_id == row.id)
+        assert child.lifted == expected
+        assert child.bodyweight == D(84)
+        assert child.performed_on == date(2020, 2, 1)
+        with pytest.raises(ValueError, match="троеборье"):
+            await service.update_result(123, child.id, D(150), D(84), date(2020, 1, 1), movement)
+        with pytest.raises(ValueError, match="троеборье"):
+            await service.delete_result(123, child.id, movement)
+    await service.delete_result(123, row.id, "total")
+    assert await service.history(123, category="total") == []
+    assert len(await service.history(123)) == 1
+    assert await service.result(123, single.id) is not None  # IDs may overlap across tables.
+
+
+@pytest.mark.parametrize("bad", [None, D(0), D(-1), D("NaN"), D("1000.01")])
+async def test_total_requires_three_valid_weights(service, bad):
+    await service.register(123, "Атлет", "male", D(85), "UTC")
+    with pytest.raises(ValueError):
+        await service.add_total(123, D(200), D(130), bad, D(85), date(2020, 1, 2), "bad")
+    assert await service.history(123, category="total") == []
+
+
+async def test_total_permissions_snapshot_and_invalid_update(service):
+    user = await service.register(123, "Атлет", "male", D(85), "UTC")
+    await service.register(456, "Другой", "male", D(90), "UTC")
+    row = await service.add_total(123, D(200), D(130), D(220), D(85), date(2020, 1, 2), "total")
+    assert await service.result(456, row.id, "total") is None
+    with pytest.raises(ValueError):
+        await service.update_total(456, row.id, D(210), D(130), D(220), D(85), date(2020, 1, 2))
+    with pytest.raises(ValueError):
+        await service.delete_result(456, row.id, "total")
+    with pytest.raises(ValueError):
+        await service.update_total(123, row.id, D(210), D(130), D(0), D(85), date(2020, 1, 2))
+    assert (await service.result(123, row.id, "total")).squat == D(200)
+    async with service.sessions() as session:
+        stored = await session.get(User, user.id)
+        stored.sex = "female"
+        await session.commit()
+    updated = await service.update_total(
+        123, row.id, D(210), D(130), D(220), D(160), date(2020, 2, 1)
+    )
+    assert updated.sex == "male"
+    with pytest.raises(ValueError):
+        await service.add_total(
+            123, D(200), D(130), D(220), D(85), date.today() + timedelta(days=2), "future"
+        )
+
+
+async def test_best_results_include_linked_lifts_and_recalculate(service):
+    await service.register(123, "Атлет", "male", D(85), "UTC")
+    await service.register(456, "Другой", "male", D(90), "UTC")
+    assert all(row is None for row in (await service.best_results(123)).values())
+    day = date(2020, 1, 2)
+    bench = await service.add_bench(123, D(150), D(85), day, "bench")
+    total = await service.add_total(123, D(200), D(130), D(220), D(84), day, "total")
+    await service.add_bench(456, D(500), D(90), day, "other")
+    # The best single lifts can belong to different dates, but the best total cannot.
+    await service.add_lift(123, D(300), D(85), day, "squat", "squat")
+    await service.add_lift(123, D(320), D(85), day, "deadlift", "deadlift")
+    best = await service.best_results(123)
+    assert best["bench"].id == bench.id
+    assert best["squat"].lifted == D(300)
+    assert best["deadlift"].lifted == D(320)
+    assert best["total"].lifted == D(550)  # Not the sum of unrelated single-lift records.
+    await service.update_total(123, total.id, D(210), D(160), D(230), D(83), date(2020, 1, 3))
+    best = await service.best_results(123)
+    assert best["bench"].lifted == D(160)
+    assert best["total"].lifted == D(600)
+    await service.delete_result(123, total.id, "total")
+    best = await service.best_results(123)
+    assert best["bench"].lifted == D(150)
+    assert best["total"] is None
+    await service.update_result(123, bench.id, D(100), D(85), day)
+    assert (await service.best_results(123))["bench"].lifted == D(100)
+
+
+async def test_best_results_choose_weight_before_date_and_use_full_history(service):
+    await service.register(123, "Атлет", "male", D(85), "UTC")
+    record = await service.add_bench(123, D(150), D(85), date(2019, 1, 1), "record")
+    for day in range(1, 8):
+        await service.add_bench(123, D(100), D(85), date(2020, 1, day), f"day-{day}")
+    assert (await service.best_results(123))["bench"].id == record.id
+    newer = await service.add_bench(123, D(150), D(85), date(2020, 2, 1), "same-weight")
+    assert (await service.best_results(123))["bench"].id == newer.id
